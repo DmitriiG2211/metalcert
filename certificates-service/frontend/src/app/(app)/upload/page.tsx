@@ -82,7 +82,12 @@ export default function UploadPage() {
       } catch {
         // ignore polling errors
       }
-      if (attempts > 30) clearInterval(timer);
+      if (attempts > 30) {
+        clearInterval(timer);
+        setFiles((prev) =>
+          prev.map((f) => (f.id === fileId ? { ...f, status: "done" } : f))
+        );
+      }
     }, 3000);
   };
 
