@@ -3,7 +3,7 @@ import os
 from typing import Optional
 from datetime import date
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, status, Query
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status, Query
 
 logger = logging.getLogger(__name__)
 from fastapi.responses import FileResponse
@@ -22,16 +22,67 @@ from app.schemas.certificate import (
     CertificateUpdate,
 )
 from app.services.file_service import FileService
-from app.workers.tasks import process_certificate, process_certificate_bg
+from app.services.ocr_service import OCRService
+from app.services.parser_service import parser_service
 
 router = APIRouter()
 file_service = FileService()
+ocr_service = OCRService()
+
+
+async def _process_certificate(cert: Certificate, db: AsyncSession) -> None:
+    """Process certificate inline using existing DB session."""
+    try:
+        cert.status = CertificateStatus.processing
+        await db.commit()
+
+        preview_path = file_service.generate_preview(cert.file_path)
+        if preview_path:
+            cert.preview_path = preview_path
+
+        text, confidence = await ocr_service.extract_text(cert.file_path)
+        cert.extracted_text = text
+        cert.ocr_confidence = confidence
+
+        if text:
+            parsed = parser_service.parse_certificate(text)
+            cert.product_name = parsed.get("product_name")
+            cert.normalized_product_name = parsed.get("normalized_product_name")
+            cert.product_type = parsed.get("product_type")
+            cert.material = parsed.get("material")
+            cert.gost = parsed.get("gost")
+            cert.dimensions = parsed.get("dimensions")
+            cert.certificate_number = parsed.get("certificate_number")
+            cert.certificate_date = parsed.get("certificate_date")
+            cert.manufacturer = parsed.get("manufacturer")
+            cert.batch_number = parsed.get("batch_number")
+            cert.heat_number = parsed.get("heat_number")
+
+        if not text or confidence < 0.3:
+            cert.status = CertificateStatus.needs_review
+        elif not cert.normalized_product_name:
+            cert.status = CertificateStatus.needs_review
+        else:
+            cert.status = CertificateStatus.parsed
+
+        await db.commit()
+        await db.refresh(cert)
+        logger.info(f"Certificate {cert.id} processed: status={cert.status.value}, conf={confidence:.2f}")
+
+    except Exception as exc:
+        logger.exception(f"Failed to process certificate {cert.id}: {exc}")
+        try:
+            cert.status = CertificateStatus.failed
+            cert.error_message = str(exc)[:500]
+            await db.commit()
+            await db.refresh(cert)
+        except Exception:
+            pass
 
 
 @router.post("/upload", response_model=CertificateResponse, status_code=status.HTTP_201_CREATED)
 async def upload_certificate(
     file: UploadFile = File(...),
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -61,7 +112,7 @@ async def upload_certificate(
     await db.commit()
     await db.refresh(cert)
 
-    background_tasks.add_task(process_certificate_bg, cert.id)
+    await _process_certificate(cert, db)
 
     return cert
 
@@ -227,7 +278,6 @@ async def get_certificate_file(
 @router.post("/{cert_id}/reprocess", response_model=CertificateResponse)
 async def reprocess_certificate(
     cert_id: int,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -241,7 +291,6 @@ async def reprocess_certificate(
 
     cert.status = CertificateStatus.uploaded
     await db.commit()
-    await db.refresh(cert)
 
-    background_tasks.add_task(process_certificate_bg, cert_id)
+    await _process_certificate(cert, db)
     return cert
