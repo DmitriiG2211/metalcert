@@ -3,7 +3,7 @@ import os
 from typing import Optional
 from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, status, Query
 
 logger = logging.getLogger(__name__)
 from fastapi.responses import FileResponse
@@ -22,7 +22,7 @@ from app.schemas.certificate import (
     CertificateUpdate,
 )
 from app.services.file_service import FileService
-from app.workers.tasks import process_certificate
+from app.workers.tasks import process_certificate, process_certificate_bg
 
 router = APIRouter()
 file_service = FileService()
@@ -31,6 +31,7 @@ file_service = FileService()
 @router.post("/upload", response_model=CertificateResponse, status_code=status.HTTP_201_CREATED)
 async def upload_certificate(
     file: UploadFile = File(...),
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -60,11 +61,7 @@ async def upload_certificate(
     await db.commit()
     await db.refresh(cert)
 
-    # Enqueue background processing (Celery may not be running)
-    try:
-        process_certificate.delay(cert.id)
-    except Exception:
-        logger.warning(f"Celery unavailable, certificate {cert.id} queued manually")
+    background_tasks.add_task(process_certificate_bg, cert.id)
 
     return cert
 
@@ -230,6 +227,7 @@ async def get_certificate_file(
 @router.post("/{cert_id}/reprocess", response_model=CertificateResponse)
 async def reprocess_certificate(
     cert_id: int,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -245,5 +243,5 @@ async def reprocess_certificate(
     await db.commit()
     await db.refresh(cert)
 
-    process_certificate.delay(cert_id)
+    background_tasks.add_task(process_certificate_bg, cert_id)
     return cert
